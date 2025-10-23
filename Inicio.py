@@ -4,12 +4,13 @@ import io
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 import numpy as np
-import os
-from openai import OpenAI
-import openai
+import requests # Importación necesaria para la API de Gemini con requests
+import json     # Importación necesaria para manejar JSON
+import time     # Importación necesaria para el retroceso exponencial
 
 # --- Configuraciones del LLM y Session State ---
-# Se utiliza el modelo OpenAI gpt-4o-mini para el análisis de visión.
+# Se utiliza el modelo Gemini Flash para el análisis de visión.
+GEMINI_CHAT_MODEL = "gemini-2.5-flash-preview-09-2025" 
 
 if 'analysis_done' not in st.session_state:
     st.session_state.analysis_done = False
@@ -125,7 +126,7 @@ div[data-testid="stMarkdownContainer"] {
 st.markdown(base_css, unsafe_allow_html=True)
 
 
-# --- Funciones de Utilidad ---
+# --- Funciones de Utilidad para la API de Gemini ---
 
 def encode_image_to_base64(image):
     """Codifica un objeto PIL Image a una cadena Base64."""
@@ -135,6 +136,105 @@ def encode_image_to_base64(image):
     encoded_image = base64.b64encode(buf.getvalue()).decode("utf-8")
     return encoded_image
 
+def safe_fetch_request(url, api_key, method='POST', headers=None, body=None, max_retries=3, delay=1):
+    """Realiza llamadas a la API con reintentos y retroceso exponencial usando 'requests'."""
+    if headers is None:
+        headers = {'Content-Type': 'application/json'}
+    
+    # Agregar la clave API a la URL
+    url_with_key = f"{url}?key={api_key}"
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.request(method, url_with_key, headers=headers, data=body, timeout=30)
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code in [429, 500, 503] and attempt < max_retries - 1:
+                time.sleep(delay * (2 ** attempt))
+                continue
+            else:
+                error_detail = response.text if response.text else f"Código de estado: {response.status_code}"
+                raise Exception(f"Fallo en la llamada a la API ({response.status_code}). {error_detail}")
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                time.sleep(delay * (2 ** attempt))
+                continue
+            raise e
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(delay * (2 ** attempt))
+                continue
+            raise e
+    raise Exception("Llamada a la API fallida después de múltiples reintentos.")
+
+def get_gemini_vision_answer(base64_image: str, mime_type: str, user_prompt: str, api_key: str) -> str:
+    """Invoca la API de Gemini para análisis de visión."""
+    
+    apiUrl = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CHAT_MODEL}:generateContent"
+
+    # Construcción del payload
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": user_prompt},
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": base64_image
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    response_data = safe_fetch_request(apiUrl, api_key, body=json.dumps(payload))
+    
+    # Manejo de la respuesta
+    candidate = response_data.get('candidates', [{}])[0]
+    text = candidate.get('content', {}).get('parts', [{}])[0].get('text', None)
+
+    if text:
+        return text
+    
+    error_message = response_data.get('error', {}).get('message', 'Respuesta incompleta o vacía del modelo.')
+    raise Exception(f"Fallo en la Visión: {error_message}")
+
+def get_gemini_story_answer(user_prompt: str, api_key: str) -> str:
+    """Invoca la API de Gemini para generación de historia."""
+    
+    apiUrl = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CHAT_MODEL}:generateContent"
+
+    # Construcción del payload
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": user_prompt}
+                ]
+            }
+        ],
+        "systemInstruction": {
+             "parts": [{"text": "Actúa como un escriba místico de la era victoriana que narra cuentos con tono oscuro, mágico y misterioso, aptos para niños valientes."}]
+        }
+    }
+
+    response_data = safe_fetch_request(apiUrl, api_key, body=json.dumps(payload))
+    
+    # Manejo de la respuesta
+    candidate = response_data.get('candidates', [{}])[0]
+    text = candidate.get('content', {}).get('parts', [{}])[0].get('text', None)
+
+    if text:
+        return text
+    
+    error_message = response_data.get('error', {}).get('message', 'Respuesta incompleta o vacía del modelo.')
+    raise Exception(f"Fallo en el Relato: {error_message}")
+
 
 # --- Streamlit App Setup ---
 st.set_page_config(page_title='El Lienzo del Oráculo', layout="centered")
@@ -143,7 +243,7 @@ st.title('🌌 El Lienzo del Oráculo: Desentrañando la Pesadilla')
 # --- Sidebar (El Sueño del Cazador) ---
 with st.sidebar:
     st.subheader("El Scriptorium Arcaico")
-    st.markdown("Este Lienzo, imbuido del poder de la **Visión del Oráculo**, permite transcribir tus símbolos más profundos para buscar un significado oculto. Cada trazo es una oración en la noche de la cacería.")
+    st.markdown("Este Lienzo, imbuido del poder de la **Visión del Oráculo (Gemini)**, permite transcribir tus símbolos más profundos para buscar un significado oculto. Cada trazo es una oración en la noche de la cacería.")
     st.markdown("---")
     
     st.subheader("La Sangre del Trazo")
@@ -170,17 +270,10 @@ canvas_result = st_canvas(
 )
 
 # --- Controles de la API y Análisis ---
-ke = st.text_input('Incrusta la Llave de la Revelación (OpenAI Key)', type="password", 
+ke = st.text_input('Incrusta la Llave de la Revelación (Gemini Key)', type="password", 
                     help="La llave arcaica es vital para invocar la percepción de la entidad del Oráculo.")
 
 api_key = ke
-
-# Inicializar el cliente OpenAI (la inicialización falla si la clave está vacía, manejado con try/except)
-try:
-    client = OpenAI(api_key=api_key)
-except Exception:
-    client = None
-
 
 additional_details = st.text_area(
     "Fórmula de Invocación (Pregunta al Cosmos):",
@@ -222,45 +315,22 @@ if canvas_result.image_data is not None and analyze_button:
             # 4. Construir el Prompt
             prompt_text = additional_details
             
-            # 5. Invocar la Visión (OpenAI API Call)
-            full_response = ""
-            message_placeholder = st.empty()
-            
-            response = client.chat.completions.create(
-                model= "gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt_text},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{base64_image}",
-                                },
-                            },
-                        ],
-                    }
-                ],
-                max_tokens=500,
+            # 5. Invocar la Visión (Gemini API Call)
+            full_response = get_gemini_vision_answer(
+                base64_image, 
+                'image/png', 
+                prompt_text, 
+                api_key
             )
             
-            # Extraer y mostrar la respuesta
-            if response.choices[0].message.content is not None:
-                full_response = response.choices[0].message.content
-                
-                # Mostrar la respuesta con el título gótico
-                st.markdown("### 📜 La Tablilla de la Verdad:")
-                st.markdown(full_response)
-
+            # Mostrar la respuesta con el título gótico
+            st.markdown("### 📜 La Tablilla de la Verdad:")
+            st.markdown(full_response)
 
             # 6. Guardar en session_state
             st.session_state.full_response = full_response
             st.session_state.analysis_done = True
             
-        except openai.APIError as e:
-            st.error(f"💀 Error de la API de OpenAI. La Visión fue bloqueada: {e}")
-            st.session_state.analysis_done = False
         except Exception as e:
             st.error(f"💀 Error en el Rito. La Visión fue bloqueada por fuerzas desconocidas: {e}")
             st.session_state.analysis_done = False
@@ -280,14 +350,10 @@ if st.session_state.analysis_done:
             story_prompt = f"Basándote en la siguiente revelación mística: '{st.session_state.full_response}', crea una historia corta, mágica y apta para niños. La historia debe ser creativa y tener un tono de cuento de hadas oscuro o misterioso, apropiado para el tema."
             
             try:
-                story_response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": story_prompt}],
-                    max_tokens=700, 
-                )
+                story_response = get_gemini_story_answer(story_prompt, api_key)
                 
                 st.markdown("### 📜 El Libro de los Sueños:")
-                st.markdown(story_response.choices[0].message.content)
+                st.markdown(story_response)
             except Exception as e:
                  st.error(f"💀 Error al forjar el relato: {e}")
 
